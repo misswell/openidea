@@ -9,11 +9,13 @@ import {
   call,
   commands,
   isTauri,
+  isCancelled,
   nextRequestId,
   type DebugEvent,
   type DebugSessionId,
   type RequestId,
 } from "@/platform/ipc";
+import { setContext } from "@/platform/context";
 import { maybeEditorService, notifications } from "@/workbench/contributions";
 import { isLive, useDebug, type DebugSession } from "./state";
 import { tx } from "@/platform/i18n";
@@ -23,11 +25,14 @@ const KEY = "debug.hotswap";
 /** `BUILD_COMPLETE` events of our own build are not worth a prompt. */
 let quietUntil = 0;
 /** The compile request HotSwap is waiting on, so it can be cancelled. */
-let activeBuild: RequestId | null = null;
+let activeBuild: { request: RequestId; cancelled: boolean } | null = null;
+let reloading = false;
 
 /** Cancels a running HotSwap compile; the reload is aborted rather than applied to stale classes. */
 export function cancelHotSwapBuild(): void {
-  if (activeBuild !== null) void commands.cancelRequest(activeBuild);
+  if (activeBuild === null || activeBuild.cancelled) return;
+  activeBuild.cancelled = true;
+  void commands.cancelRequest(activeBuild.request).catch(() => {});
 }
 
 export function hotSwapSessions(): DebugSession[] {
@@ -55,11 +60,13 @@ export function hotSwapMessage(
 
 /** Compiles (unless `build` is false) and reloads changed classes into every Java debug session. */
 export async function reloadChangedClasses(build = true, configId?: string): Promise<void> {
+  if (reloading) return;
   const sessions = hotSwapSessions().filter((s) => !configId || s.runConfig?.id === configId);
   if (!sessions.length || !isTauri()) {
     notifications().notify({ group: "run", level: "info", key: KEY, title: "No debug session can reload classes" });
     return;
   }
+  reloading = true;
   quietUntil = Date.now() + 60_000;
   try {
     if (build) {
@@ -71,16 +78,37 @@ export async function reloadChangedClasses(build = true, configId?: string): Pro
       const modules = new Set(sessions.map((s) => s.launch?.cwd ?? ""));
       for (const module of modules) {
         const request = nextRequestId();
-        activeBuild = request;
+        const compile = { request, cancelled: false };
+        activeBuild = compile;
+        setContext("debugHotSwapBuilding", true);
+        notifications().notify({
+          group: "run",
+          level: "info",
+          key: KEY,
+          title: "Compiling changed classes…",
+          sticky: true,
+          actions: [{ label: "Cancel Hot Swap Build", run: cancelHotSwapBuild }],
+        });
         let status: "cancelled" | "failed" | "succeeded" | "withErrors" | null = null;
         try {
           status = await call(commands.javaBuildWorkspace(module, request));
-        } catch {
-          status = null;
+        } catch (e) {
+          status = isCancelled(e) ? "cancelled" : null;
         } finally {
-          if (activeBuild === request) activeBuild = null;
+          activeBuild = null;
+          setContext("debugHotSwapBuilding", false);
         }
-        if (status === "cancelled") {
+        if (compile.cancelled || status === "cancelled") {
+          // JDT can write class files before cancellation without publishing their
+          // build deltas. java-debug cannot recover those classes on the next build.
+          useDebug.setState((state) => ({
+            sessions: Object.fromEntries(
+              Object.entries(state.sessions).map(([id, s]) => [
+                id,
+                isLive(s) && s.caps?.hotCodeReplace ? { ...s, hotSwapNeedsRestart: true } : s,
+              ]),
+            ),
+          }));
           notifications().notify({ group: "run", level: "info", key: KEY, title: "Hot Swap cancelled" });
           return;
         }
@@ -96,6 +124,16 @@ export async function reloadChangedClasses(build = true, configId?: string): Pro
         }
       }
     }
+    if (sessions.some((s) => useDebug.getState().sessions[s.id]?.hotSwapNeedsRestart)) {
+      notifications().notify({
+        group: "run",
+        level: "error",
+        key: KEY,
+        title: "Hot Swap failed",
+        body: "A cancelled build may have left classes out of the reload. Restart the debug session to apply all changes.",
+      });
+      return;
+    }
     const changed = new Set<string>();
     const errors: string[] = [];
     for (const s of sessions) {
@@ -110,6 +148,7 @@ export async function reloadChangedClasses(build = true, configId?: string): Pro
     const m = hotSwapMessage(changed.size, errors);
     notifications().notify({ group: "run", key: KEY, ...m });
   } finally {
+    reloading = false;
     quietUntil = Date.now() + 2_000;
   }
 }
@@ -119,7 +158,7 @@ export function onHotCodeReplace(session: DebugSessionId, event: Extract<DebugEv
   if (!useDebug.getState().sessions[session]) return;
   switch (event.changeType) {
     case "BUILD_COMPLETE":
-      if (Date.now() < quietUntil) return;
+      if (reloading || Date.now() < quietUntil) return;
       notifications().notify({
         group: "run",
         level: "info",
