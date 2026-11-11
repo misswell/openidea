@@ -12,6 +12,10 @@ pub(super) struct Outputs {
     fingerprint: Option<LaunchFingerprint>,
     pub snapshot: PathBuf,
     pub originals: Vec<PathBuf>,
+    /// Built with `clean compile`; only these snapshots may serve an Automatic main launch.
+    /// Records written before this field existed deserialize as false and are rebuilt.
+    #[serde(default)]
+    pub clean: bool,
     #[serde(skip)]
     pub failure: Option<String>,
 }
@@ -34,8 +38,8 @@ fn record_path(root: &Path, cache: &Path, module: &Path, test: bool) -> Option<P
     }))
 }
 
-pub(super) fn has_record(root: &Path, cache: &Path, module: &Path) -> bool {
-    [false, true].into_iter().any(|test| record_path(root, cache, module, test).is_some_and(|record| record.is_file()))
+pub(super) fn has_record(root: &Path, cache: &Path, module: &Path, test: bool) -> bool {
+    record_path(root, cache, module, test).is_some_and(|record| record.is_file())
 }
 
 #[derive(Default)]
@@ -110,9 +114,14 @@ impl Session {
             }
             before = fingerprint()?;
         }
+        // An Automatic main launch must not reuse a snapshot that may contain classes
+        // instrumented by an earlier incremental build. Only a clean snapshot qualifies;
+        // old records (written before `clean` existed) deserialize as false and rebuild.
+        let clean = policy == BuildPolicy::Rebuild || (policy == BuildPolicy::Automatic && !test);
         if let Some(outputs) = previous.as_ref()
             && policy != BuildPolicy::Rebuild
             && outputs.reusable(&before, &snapshots)
+            && (!clean || outputs.clean)
         {
             tracing::info!(module = %module.display(), test, "Reusing Maven launch snapshot");
             return Ok(previous.unwrap());
@@ -124,7 +133,7 @@ impl Session {
         if let Some(previous) = &previous {
             self.unreferenced.push(previous.snapshot.clone());
         }
-        let kind = if policy == BuildPolicy::Rebuild { compile::BuildKind::Rebuild } else { compile::BuildKind::Build };
+        let kind = if clean { compile::BuildKind::Rebuild } else { compile::BuildKind::Build };
         let built = compile::build_for_launch(root, model, module, test, kind, cancel)?;
         if let Some(failure) = &built.failure {
             if policy != BuildPolicy::MakeAndContinueOnErrors {
@@ -156,7 +165,13 @@ impl Session {
         if cancel.is_cancelled() {
             return Err(IdeError::cancelled());
         }
-        let mut outputs = Outputs { fingerprint: None, snapshot, originals, failure: built.failure };
+        let mut outputs = Outputs {
+            fingerprint: None,
+            snapshot,
+            originals,
+            clean: kind == compile::BuildKind::Rebuild,
+            failure: built.failure,
+        };
         if outputs.failure.is_none() && before.is_some() && before == after {
             outputs.fingerprint = before;
             fs::create_dir_all(record.parent().unwrap())?;
@@ -394,6 +409,36 @@ mod tests {
     }
 
     #[test]
+    fn automatic_main_does_not_reuse_a_non_clean_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let model = fixture(root);
+        let cache = root.join("cache");
+        let cancel = CancellationToken::new();
+        let mut session = Session::new(cache.clone());
+        let options = BuildOptions { test: false, policy: BuildPolicy::Automatic };
+        let first = session.build(root, &model, root, options, None, &cancel).unwrap();
+        assert!(first.clean, "Automatic main builds a clean snapshot");
+        assert!(
+            fs::read_to_string(root.join("calls")).unwrap().lines().next().unwrap().contains("clean"),
+            "the first Automatic main build must clean Maven output"
+        );
+
+        // An old record, or one written by an incremental build, has no clean provenance.
+        let record = cache.join("java-launch/records/main.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        value["clean"] = false.into();
+        fs::write(&record, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let second = session
+            .build(root, &model, root, BuildOptions { test: false, policy: BuildPolicy::Automatic }, None, &cancel)
+            .unwrap();
+        assert_ne!(second.snapshot, first.snapshot, "a non-clean snapshot must be rebuilt");
+        assert!(second.clean);
+        assert_eq!(fs::read_to_string(root.join("calls")).unwrap().lines().count(), 2);
+    }
+
+    #[test]
     fn restart_after_mtime_preserving_external_edit_actually_recompiles() {
         // The content hash triggers a rebuild for a same-length, same-mtime external
         // edit, but a timestamp-incremental builder (real Maven) would still compile
@@ -483,7 +528,13 @@ mod tests {
         fs::write(snapshots.join("launch-file"), "keep").unwrap();
         let record = cache.join("java-launch/records/deep/module/test.json");
         fs::create_dir_all(record.parent().unwrap()).unwrap();
-        let outputs = Outputs { fingerprint: None, snapshot: retained.clone(), originals: Vec::new(), failure: None };
+        let outputs = Outputs {
+            fingerprint: None,
+            snapshot: retained.clone(),
+            originals: Vec::new(),
+            clean: false,
+            failure: None,
+        };
         fs::write(record, serde_json::to_vec(&outputs).unwrap()).unwrap();
         let mut session = Session::new(cache);
         session.initialize();
@@ -542,6 +593,21 @@ mod tests {
         assert!(!outputs.snapshot.exists());
     }
     #[test]
+    fn main_and_test_records_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cache = root.join("cache");
+        let main = record_path(root, &cache, root, false).unwrap();
+        fs::create_dir_all(main.parent().unwrap()).unwrap();
+        fs::write(&main, b"null").unwrap();
+        assert!(has_record(root, &cache, root, false));
+        assert!(!has_record(root, &cache, root, true), "a main snapshot must not make a test launch delegate");
+        let test = record_path(root, &cache, root, true).unwrap();
+        fs::write(&test, b"null").unwrap();
+        assert!(has_record(root, &cache, root, true));
+    }
+
+    #[test]
     fn deleting_the_last_mixed_source_keeps_maven_delegation_after_failure() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -552,9 +618,9 @@ mod tests {
         let first = session.build(root, &model, root, BuildOptions::default(), None, &cancel).unwrap();
         fs::remove_file(root.join("src/main/kotlin/Main.kt")).unwrap();
         assert!(!compile::launch_has_non_java_sources(root, &model, root, false));
-        assert!(has_record(root, &cache, root));
+        assert!(has_record(root, &cache, root, false));
         assert!(session.build(root, &model, root, BuildOptions::default(), None, &cancel).is_err());
-        assert!(has_record(root, &cache, root));
+        assert!(has_record(root, &cache, root, false));
         fs::write(root.join("src/main/kotlin/Main.kt"), "restored").unwrap();
         let restored = session.build(root, &model, root, BuildOptions::default(), None, &cancel).unwrap();
         assert_ne!(first.snapshot, restored.snapshot);

@@ -42,7 +42,8 @@ async fn resolve_launch(
     let project = host.project(window)?;
     let module = project.root.join(module);
     let settings = project.settings.effective();
-    // A launch builds incrementally unless the configuration asks for Rebuild or NoBuild.
+    // A launch builds unless the configuration asks for NoBuild. Delegated Maven
+    // launches decide their own clean/incremental kind in the snapshot cache.
     let build = policy != BuildPolicy::NoBuild;
     let full = policy == BuildPolicy::Rebuild;
     let build_kind = if full { compile::BuildKind::Rebuild } else { compile::BuildKind::Build };
@@ -60,8 +61,9 @@ async fn resolve_launch(
                 && delegates_to_external_build(
                     is_maven,
                     policy,
+                    test,
                     non_java,
-                    cache::has_record(&project.root, &project.build_cache_dir(), &module),
+                    cache::has_record(&project.root, &project.build_cache_dir(), &module, test),
                 );
             let external = non_java || delegated;
             (model, external, delegated)
@@ -86,7 +88,8 @@ async fn resolve_launch(
                 &cancel,
             )?;
             let copies = use_snapshot(&mut info, &outputs.originals, &outputs.snapshot);
-            apply_external_build_result(&mut info, outputs.failure, policy == BuildPolicy::Rebuild);
+            let clean = outputs.clean;
+            apply_external_build_result(&mut info, outputs.failure, clean);
             copies
         } else if external {
             let built = compile::build_for_launch(&project.root, &model, &module, test, build_kind, &cancel)?;
@@ -226,9 +229,18 @@ fn apply_library_classpath(
 
 /// Whether a launch should be built by the project's build system instead of jdtls.
 /// A Rebuild has to clean the output; jdtls' full build only recompiles sources, so
-/// Maven modules always delegate for it, even when every source is Java.
-fn delegates_to_external_build(is_maven: bool, policy: BuildPolicy, non_java: bool, has_record: bool) -> bool {
-    is_maven && (policy == BuildPolicy::Rebuild || non_java || has_record)
+/// Maven modules always delegate for it, even when every source is Java. Maven main
+/// applications do the same for Automatic so their run classpath is a clean snapshot;
+/// test launches keep their old builder choice.
+fn delegates_to_external_build(
+    is_maven: bool,
+    policy: BuildPolicy,
+    test: bool,
+    non_java: bool,
+    has_record: bool,
+) -> bool {
+    is_maven
+        && (policy == BuildPolicy::Rebuild || (policy == BuildPolicy::Automatic && !test) || non_java || has_record)
 }
 
 fn same_entry(a: &str, b: &str, windows: bool) -> bool {
@@ -308,13 +320,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rebuild_delegates_maven_builds_to_the_build_system() {
-        assert!(delegates_to_external_build(true, BuildPolicy::Rebuild, false, false));
-        assert!(delegates_to_external_build(true, BuildPolicy::Automatic, true, false));
-        assert!(delegates_to_external_build(true, BuildPolicy::Make, false, true));
-        assert!(!delegates_to_external_build(true, BuildPolicy::Automatic, false, false));
-        assert!(!delegates_to_external_build(true, BuildPolicy::Make, false, false));
-        assert!(!delegates_to_external_build(false, BuildPolicy::Rebuild, false, false));
+    fn automatic_main_and_rebuild_delegate_maven_builds_to_the_build_system() {
+        assert!(delegates_to_external_build(true, BuildPolicy::Rebuild, false, false, false));
+        assert!(delegates_to_external_build(true, BuildPolicy::Automatic, false, false, false));
+        assert!(delegates_to_external_build(true, BuildPolicy::Automatic, false, true, false));
+        assert!(delegates_to_external_build(true, BuildPolicy::Automatic, false, false, true));
+        assert!(delegates_to_external_build(true, BuildPolicy::Make, false, false, true));
+        assert!(!delegates_to_external_build(true, BuildPolicy::Automatic, true, false, false));
+        assert!(!delegates_to_external_build(true, BuildPolicy::Make, false, false, false));
+        assert!(!delegates_to_external_build(false, BuildPolicy::Rebuild, false, false, false));
     }
 
     #[test]
