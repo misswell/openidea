@@ -143,6 +143,10 @@ impl Dispatcher {
         let mut d = Self::default();
         d.add("project_trust_status", |c| async move { c.host.trust.status(&c.arg::<PathBuf>("path")?) })
             .add("project_trust_list", |c| async move { c.host.trust.decisions() })
+            .add("project_trust_add_location", |c| async move {
+                c.host.trust.add_location(&c.arg::<PathBuf>("path")?)?;
+                c.host.refresh_project_trust().await
+            })
             .add("project_trust_set", |c| async move {
                 c.host.set_project_trust(&c.arg::<PathBuf>("path")?, c.arg("trusted")?, c.arg("folder")?).await
             })

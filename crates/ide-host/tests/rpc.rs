@@ -123,6 +123,14 @@ async fn serves_projects_files_documents_search_and_runs() {
         assert!(error.message.contains("Restricted Mode"), "{command}: {error:?}");
     }
     invoke(&peer, "project_trust_set", json!({"path": project, "trusted": true, "folder": false})).await.unwrap();
+    let location = std::fs::canonicalize(project.join("src")).unwrap();
+    invoke(&peer, "project_trust_add_location", json!({"path": location})).await.unwrap();
+    let decisions = invoke(&peer, "project_trust_list", json!({})).await.unwrap();
+    let location_text = location.to_string_lossy();
+    assert!(decisions["locations"].as_array().unwrap().iter().any(|path| path.as_str() == Some(&location_text)));
+    invoke(&peer, "project_trust_remove_location", json!({"path": location})).await.unwrap();
+    let decisions = invoke(&peer, "project_trust_list", json!({})).await.unwrap();
+    assert!(!decisions["locations"].as_array().unwrap().iter().any(|path| path.as_str() == Some(&location_text)));
     let current = invoke(&peer, "project_current", json!({})).await.unwrap();
     assert_eq!(current["name"], "demo");
 
