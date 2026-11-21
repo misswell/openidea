@@ -164,6 +164,44 @@ impl Dispatcher {
             ops::jvm_icons::jvm_file_presentations(&c.host, &c.window, c.arg("paths")?).await
         })
         .add("project_roots", |c| async move { ops::project::roots(&c.host, &c.window) })
+        .add("workspace_create", |c| async move {
+            let path: PathBuf = c.arg("path")?;
+            let name: String = c.arg("name")?;
+            let projects: Vec<PathBuf> = c.arg("projects")?;
+            c.host
+                .blocking(move || {
+                    ide_workspace::workspace::Workspace::save(&path, &name, projects, true)?;
+                    Ok(ide_core::IpcPath::from(dunce::canonicalize(path)?))
+                })
+                .await
+        })
+        .add("workspace_update", |c| async move {
+            let host = c.host.clone();
+            let window = c.window.clone();
+            let name: String = c.arg("name")?;
+            let projects: Vec<PathBuf> = c.arg("projects")?;
+            let worker_host = host.clone();
+            host.blocking(move || ops::project::save_workspace(&worker_host, &window, &name, projects)).await
+        })
+        .add("workspace_attach", |c| async move {
+            let host = c.host.clone();
+            let window = c.window.clone();
+            let path: PathBuf = c.arg("path")?;
+            let worker_host = host.clone();
+            host.blocking(move || ops::project::attach_workspace(&worker_host, &window, &path)).await
+        })
+        .add("workspace_discover_projects", |c| async move {
+            let request = c.arg::<RequestId>("request")?;
+            let folders: Vec<PathBuf> = c.arg("folders")?;
+            let cancel = c.host.begin_request(request);
+            let result =
+                tokio::task::spawn_blocking(move || ide_workspace::project_discovery::discover(folders, &cancel))
+                    .await
+                    .map_err(|e| IdeError::internal(e.to_string()))
+                    .and_then(|result| result);
+            c.host.end_request(request);
+            result
+        })
         .add("settings_get", |c| async move { Ok(ops::project::settings(&c.host, &c.window)) })
         .add("settings_set", |c| async move {
             let key: String = c.arg("key")?;
