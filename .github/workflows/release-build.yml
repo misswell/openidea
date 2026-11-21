@@ -88,6 +88,7 @@ jobs:
       # Signing is optional: only secrets that are set get exported, so forks and
       # unconfigured repos produce unsigned builds instead of failing.
       - name: Signing env
+        id: signing
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE || '' }}
@@ -99,18 +100,30 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "config_arg=" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "config_arg=--config src-tauri/tauri.unsigned.json" >> "$GITHUB_OUTPUT"
+          fi
           for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID \
                    APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
             [ -n "${!v}" ] && { echo "$v<<__EOF__"; echo "${!v}"; echo "__EOF__"; } >> "$GITHUB_ENV"
           done
           true
+      - name: Disable updater artifacts without a signing key
+        if: steps.signing.outputs.available != 'true'
+        shell: bash
+        run: |
+          printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > src-tauri/tauri.unsigned.json
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           releaseId: ${{ inputs.release_id }}
           tagName: ${{ env.TAG }}
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} ${{ steps.signing.outputs.config_arg }}
           # The parallel builds would race on one latest.json; `updater-manifest` writes it once.
           uploadUpdaterJson: false
       # tauri-action notarizes the .app but not the DMG around it; notarize and
