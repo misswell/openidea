@@ -104,6 +104,48 @@ fn http() -> Option<Http> {
     })
 }
 
+#[cfg(unix)]
+#[test]
+fn cancelled_download_kills_the_curl_process_group() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let curl = dir.path().join("curl");
+    let child_pid = dir.path().join("child.pid");
+    fs::write(&curl, format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n", child_pid.display())).unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let http = Http {
+        curl,
+        gh: None,
+        explicit_github_token: None,
+        https_only: false,
+        revoke_best_effort: false,
+        accept: None,
+    };
+    let cancel = CancellationToken::new();
+    let watcher = cancel.clone();
+    let watch = child_pid.clone();
+    let thread = std::thread::spawn(move || {
+        while !watch.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        watcher.cancel();
+    });
+
+    let err =
+        http.download("https://example.test/archive", &dir.path().join("archive"), None, &cancel, &|_| {}).unwrap_err();
+    thread.join().unwrap();
+    assert_eq!(err.kind, ErrorKind::Cancelled);
+
+    let pid: i32 = fs::read_to_string(child_pid).unwrap().trim().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(Instant::now() < deadline, "the curl child {pid} survived cancellation");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn interrupted_download_resumes_with_range() {
     let Some(http) = http() else { return };

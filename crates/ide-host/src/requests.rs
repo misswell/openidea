@@ -69,6 +69,22 @@ impl Requests {
             }
         }
     }
+
+    /// Cancels every operation owned by this host while keeping the entries
+    /// until their tasks call [`Self::end`]. Shutdown can then wait for those
+    /// tasks to kill their child-process groups before this process exits.
+    pub(crate) fn cancel_all(&self) -> usize {
+        let mut inner = self.inner.lock();
+        inner.early.clear();
+        for token in inner.running.values() {
+            token.cancel();
+        }
+        inner.running.len()
+    }
+
+    pub(crate) fn active(&self) -> usize {
+        self.inner.lock().running.len()
+    }
 }
 
 #[cfg(test)]
@@ -112,5 +128,21 @@ mod tests {
         r.end(RequestId(3));
         r.cancel(RequestId(3));
         assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn shutdown_cancels_every_running_request_until_it_ends() {
+        let r = Requests::default();
+        let first = r.begin(RequestId(1));
+        let second = r.begin(RequestId(2));
+
+        assert_eq!(r.cancel_all(), 2);
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert_eq!(r.active(), 2);
+
+        r.end(RequestId(1));
+        r.end(RequestId(2));
+        assert_eq!(r.active(), 0);
     }
 }

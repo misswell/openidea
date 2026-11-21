@@ -113,6 +113,8 @@ pub struct Host {
 
 /// How long exit waits for project shutdown before giving up.
 const EXIT_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long exit waits for cancelled RPC tasks to reap the children they own.
+const EXIT_REQUEST_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Host {
     /// Windows whose current project has this root.
@@ -433,6 +435,18 @@ impl Host {
     /// runs and terminals.
     /// For a process that exits without dropping the host (the remote server).
     pub async fn shutdown(&self) {
+        // Installers use request tokens to kill their `curl` process groups.
+        // Cancel them before `process::exit` can strand a download.
+        let active_requests = self.requests.cancel_all();
+        if active_requests > 0 {
+            let deadline = tokio::time::Instant::now() + EXIT_REQUEST_SHUTDOWN_WAIT;
+            while self.requests.active() > 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            if self.requests.active() > 0 {
+                tracing::warn!("cancelled requests did not stop within {EXIT_REQUEST_SHUTDOWN_WAIT:?}");
+            }
+        }
         // A capture's dump may hold secrets from the debuggee's memory: delete it before exiting.
         ops::heap::shutdown(self).await;
         self.environment.shutdown();
