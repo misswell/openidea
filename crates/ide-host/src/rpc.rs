@@ -21,9 +21,9 @@ use ide_jsonrpc::{Handler, Peer, codes};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
@@ -207,6 +207,14 @@ impl Dispatcher {
             result
         })
         .add("settings_get", |c| async move { Ok(ops::project::settings(&c.host, &c.window)) })
+        .add("settings_get_global", |c| async move { Ok::<_, IdeError>(c.host.global_settings.effective()) })
+        .add("settings_export", |c| async move { export_settings(&c).await })
+        .add("settings_import", |c| async move { import_settings(&c).await })
+        .add("settings_list_jetbrains_ides", |c| async move { c.host.blocking(jetbrains_settings_choices).await })
+        .add("settings_read_jetbrains", |c| async move {
+            let path: PathBuf = c.arg("path")?;
+            c.host.blocking(move || ide_workspace::settings::read_jetbrains_settings(&path)).await
+        })
         .add("settings_set", |c| async move { set_settings(&c) })
         .add("cancel_request", |c| async move {
             c.host.cancel_request(c.arg::<RequestId>("id")?);
@@ -404,6 +412,75 @@ pub fn set_settings(c: &Call) -> IdeResult<ide_core::settings::Settings> {
     Ok(applied.settings)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsImportResult {
+    settings: ide_core::settings::Settings,
+    storage: BTreeMap<String, String>,
+}
+
+async fn export_settings(c: &Call) -> IdeResult<()> {
+    let path: PathBuf = c.arg("path")?;
+    let storage: BTreeMap<String, String> = c.arg("storage")?;
+    let host = c.host.clone();
+    c.host.blocking(move || host.global_settings.export_bundle(&path, storage)).await
+}
+
+async fn import_settings(c: &Call) -> IdeResult<SettingsImportResult> {
+    let path: PathBuf = c.arg("path")?;
+    let host = c.host.clone();
+    c.host
+        .blocking(move || {
+            let (settings, storage) = host.global_settings.import_bundle(&path)?;
+            Ok(SettingsImportResult { settings, storage })
+        })
+        .await
+}
+
+#[derive(Debug, Serialize)]
+struct JetBrainsSettingsChoice {
+    ide: String,
+    path: PathBuf,
+}
+
+fn jetbrains_settings_choices() -> IdeResult<Vec<JetBrainsSettingsChoice>> {
+    let mut roots = Vec::new();
+    if cfg!(target_os = "macos") {
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join("Library/Application Support/JetBrains"));
+        }
+    } else if cfg!(windows) {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            roots.push(PathBuf::from(app_data).join("JetBrains"));
+        }
+    } else {
+        if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+            roots.push(PathBuf::from(config).join("JetBrains"));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join(".config/JetBrains"));
+        }
+    }
+
+    let mut choices = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_jetbrains_settings_folder(&path) {
+                continue;
+            }
+            choices.push(JetBrainsSettingsChoice { ide: entry.file_name().to_string_lossy().into_owned(), path });
+        }
+    }
+    choices.sort_by(|a, b| a.ide.cmp(&b.ide));
+    Ok(choices)
+}
+
+fn is_jetbrains_settings_folder(path: &Path) -> bool {
+    let options = path.join("options");
+    path.is_dir() && options.is_dir()
+}
+
 /// Serves `host` over `reader` / `writer` until the client disconnects.
 /// `peer` must be the one whose events `host` sends ([`event_sink`]).
 pub async fn serve<R, W>(host: Arc<Host>, dispatcher: Dispatcher, peer: Arc<OnceLock<Peer>>, reader: R, writer: W)
@@ -593,5 +670,18 @@ mod tests {
         ] {
             assert!(client_accepts(&event), "{event:?}");
         }
+    }
+
+    #[test]
+    fn jetbrains_settings_folders_require_options_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let incomplete = dir.path().join("Incomplete");
+        std::fs::create_dir(&incomplete).unwrap();
+        std::fs::write(incomplete.join("settings.xml"), "").unwrap();
+        assert!(!is_jetbrains_settings_folder(&incomplete));
+
+        let complete = dir.path().join("IntelliJIdea");
+        std::fs::create_dir_all(complete.join("options")).unwrap();
+        assert!(is_jetbrains_settings_folder(&complete));
     }
 }
