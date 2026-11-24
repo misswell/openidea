@@ -207,17 +207,7 @@ impl Dispatcher {
             result
         })
         .add("settings_get", |c| async move { Ok(ops::project::settings(&c.host, &c.window)) })
-        .add("settings_set", |c| async move {
-            let key: String = c.arg("key")?;
-            let scope = c.arg("scope")?;
-            let applied = ops::project::set_settings(&c.host, &c.window, scope, &key, &c.arg::<String>("value")?)?;
-            let sink = c.host.window_sink(&c.window);
-            sink.emit(IdeEvent::SettingsChanged { key });
-            if let Some(root) = applied.roots_changed {
-                sink.emit(IdeEvent::ProjectRootsChanged { root });
-            }
-            Ok(applied.settings)
-        })
+        .add("settings_set", |c| async move { set_settings(&c) })
         .add("cancel_request", |c| async move {
             c.host.cancel_request(c.arg::<RequestId>("id")?);
             Ok(())
@@ -230,6 +220,18 @@ impl Dispatcher {
             ops::fs::create_file_bytes(&c.host, &c.window, c.arg("path")?, c.arg("data")?).await
         })
         .add("fs_create_dir", |c| async move { ide_vfs::create_dir(&c.arg::<PathBuf>("path")?) })
+        .add("fs_create_dir_exclusive", |c| async move { ops::fs::create_dir_exclusive(&c.host, c.arg("path")?).await })
+        .add("fs_append_file_bytes", |c| async move {
+            ops::fs::append_file_bytes(&c.host, c.arg("path")?, c.arg("data")?, c.arg("request")?).await
+        })
+        .add("fs_create_symlink", |c| async move {
+            ops::fs::create_symlink(&c.host, c.arg("path")?, c.arg("target")?).await
+        })
+        .add("fs_set_permissions", |c| async move {
+            ops::fs::set_permissions(&c.host, c.arg("path")?, c.arg("mode")?).await
+        })
+        .add("fs_remove_file", |c| async move { ops::fs::remove_file(&c.host, c.arg("path")?).await })
+        .add("fs_remove_tree", |c| async move { ops::fs::remove_tree(&c.host, c.arg("path")?).await })
         .add("fs_rename", |c| async move { ops::fs::rename(&c.host, &c.window, c.arg("from")?, c.arg("to")?).await })
         .add("fs_set_writable", |c| async move {
             ops::fs::set_writable(&c.host, &c.window, c.arg("path")?, c.arg("writable")?)
@@ -259,6 +261,33 @@ impl Dispatcher {
             .await
         })
         .add("fs_read_text", |c| async move { ops::fs::read_text(&c.host, &c.window, c.arg("path")?).await })
+        .add("plugin_workspace_read_text", |c| async move {
+            ops::fs::plugin_workspace_read_text(&c.host, c.arg("root")?, c.arg("path")?, c.arg("request")?).await
+        })
+        .add("plugin_workspace_stat", |c| async move {
+            ops::fs::plugin_workspace_stat(&c.host, c.arg("root")?, c.arg("path")?, c.arg("request")?).await
+        })
+        .add("plugin_workspace_write_text", |c| async move {
+            ops::fs::plugin_workspace_write_text(
+                &c.host,
+                c.arg("root")?,
+                c.arg("path")?,
+                c.arg("text")?,
+                c.arg("request")?,
+            )
+            .await
+        })
+        .add("plugin_workspace_find_files", |c| async move {
+            ops::fs::plugin_workspace_find_files(
+                &c.host,
+                &c.window,
+                c.arg("root")?,
+                c.arg("glob")?,
+                c.arg("limit")?,
+                c.arg("request")?,
+            )
+            .await
+        })
         .add("doc_open", |c| async move { ops::doc::open(&c.host, &c.window, c.arg("path")?).await })
         .add("doc_close", |c| async move {
             ops::doc::blocking(move || ops::doc::close(&c.host, &c.window, c.arg("doc")?)).await
@@ -280,6 +309,11 @@ impl Dispatcher {
         .add("term_spawn", |c| async move {
             let on_output = c.channel("onOutput")?;
             ops::term::spawn(&c.host, &c.window, c.arg("options")?, on_output)
+        })
+        .add("ssh_open_terminal", |c| async move {
+            let on_output = c.channel("onOutput")?;
+            let id: String = c.arg("id")?;
+            ops::term::spawn_ssh(&c.host, &c.window, &id, c.arg("cols")?, c.arg("rows")?, on_output).await
         })
         .add("term_store_image", |c| async move {
             ops::term::store_image(&c.host, c.arg("id")?, c.arg("data")?, c.arg("mime")?).await
@@ -312,10 +346,62 @@ impl Dispatcher {
         .add("run_resize", |c| async move { ops::run::resize(&c.host, c.arg("id")?, c.arg("cols")?, c.arg("rows")?) })
         .add("run_close_stdin", |c| async move { ops::run::close_stdin(&c.host, c.arg("id")?) })
         .add("run_list", |c| async move { Ok(ops::run::list(&c.host)) })
+        .add("mcp_ui_ready", |c| async move {
+            c.host.project(&c.window)?;
+            c.host.mcp_requests.set_ready(&c.window, c.arg("ready")?);
+            Ok(())
+        })
+        .add("mcp_respond", |c| async move {
+            c.host.project(&c.window)?;
+            c.host.mcp_requests.answer(&c.window, c.arg("id")?, c.arg("allow")?, c.arg("error")?)
+        })
+        .add("mcp_agent_run_closed", |c| async move {
+            let project = c.host.project(&c.window)?;
+            let name = c.arg::<String>("name")?;
+            c.host.mcp_agent_runs.closed(&project.root, &name);
+            Ok(())
+        })
+        .add("mcp_set_open_editors", |c| async move {
+            c.host.project(&c.window)?;
+            let paths = c.arg::<Vec<ide_core::IpcPath>>("paths")?;
+            c.host.mcp_reports.set_open_editors(&c.window, paths.into_iter().map(PathBuf::from).collect());
+            Ok(())
+        })
+        .add("mcp_set_focused_editor", |c| async move {
+            c.host.project(&c.window)?;
+            c.host.mcp_reports.set_focused_editor(
+                &c.window,
+                c.arg::<Option<crate::mcp::FocusedEditor>>("editor")?,
+                c.arg("focused")?,
+            );
+            Ok(())
+        })
+        .add("mcp_report_problems", |c| async move {
+            c.host.project(&c.window)?;
+            c.host.mcp_reports.report_problems(
+                &c.window,
+                c.arg("reset")?,
+                c.arg::<Vec<crate::mcp::FileProblems>>("files")?,
+            );
+            Ok(())
+        })
         .add("vcs_status", |c| async move { ops::vcs::status(&c.host, &c.window).await });
         ops::register_all(&mut d);
         d
     }
+}
+
+/// Writes one settings key and tells the window's clients what changed.
+pub fn set_settings(c: &Call) -> IdeResult<ide_core::settings::Settings> {
+    let key: String = c.arg("key")?;
+    let scope = c.arg("scope")?;
+    let applied = ops::project::set_settings(&c.host, &c.window, scope, &key, &c.arg::<String>("value")?)?;
+    let sink = c.host.window_sink(&c.window);
+    sink.emit(IdeEvent::SettingsChanged { key });
+    if let Some(root) = applied.roots_changed {
+        sink.emit(IdeEvent::ProjectRootsChanged { root });
+    }
+    Ok(applied.settings)
 }
 
 /// Serves `host` over `reader` / `writer` until the client disconnects.

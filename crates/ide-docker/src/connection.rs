@@ -1,12 +1,13 @@
 //! Docker connections (which daemon the CLI talks to) and registries, as the
 //! Services tool window's "Add Service" menu creates them. Both are app-wide
 //! like in IDEA: `docker.json` in the app data directory; registry passwords
-//! live beside it in an owner-only `docker-passwords.json`.
+//! live in the OS credential store, with an owner-only index beside it.
 
 use ide_core::{IdeError, IdeResult};
+use ide_ssh::secrets::SecretFile;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -155,7 +156,7 @@ const SETTINGS_FILE: &str = "docker.json";
 const PASSWORDS_FILE: &str = "docker-passwords.json";
 
 pub fn load_settings(data_dir: &Path) -> DockerSettings {
-    match std::fs::read(data_dir.join(SETTINGS_FILE)) {
+    let settings = match std::fs::read(data_dir.join(SETTINGS_FILE)) {
         // A file written before the opt-in Services rework carries the injected default
         // (saved along with a registry or another connection); drop it unless edited.
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -168,7 +169,18 @@ pub fn load_settings(data_dir: &Path) -> DockerSettings {
                 DockerSettings::default()
             }),
         Err(_) => DockerSettings::default(),
+    };
+    // Loading settings is the earliest shared entry point. Touch the secret index so a
+    // legacy plaintext file is migrated before the Services view reads a password, and
+    // so registries removed outside Settings do not leave orphaned credentials behind.
+    let secrets = registry_secrets(data_dir);
+    let active: BTreeSet<&str> = settings.registries.iter().map(|r| r.id.as_str()).collect();
+    for id in secrets.keys() {
+        if !active.contains(id.as_str()) {
+            secrets.delete(&id);
+        }
     }
+    settings
 }
 
 pub fn save_settings(data_dir: &Path, settings: &DockerSettings) -> IdeResult<()> {
@@ -185,34 +197,33 @@ pub fn save_settings(data_dir: &Path, settings: &DockerSettings) -> IdeResult<()
     }
     let bytes = serde_json::to_vec_pretty(settings).map_err(|e| IdeError::internal(e.to_string()))?;
     write_file(&data_dir.join(SETTINGS_FILE), &bytes, false)?;
-    // Forget passwords of registries that are gone.
-    let mut passwords = read_passwords(data_dir);
-    let before = passwords.len();
-    passwords.retain(|id, _| settings.registries.iter().any(|r| &r.id == id));
-    if passwords.len() != before { write_passwords(data_dir, &passwords) } else { Ok(()) }
+    let secrets = registry_secrets(data_dir);
+    let active: BTreeSet<&str> = settings.registries.iter().map(|r| r.id.as_str()).collect();
+    for id in secrets.keys() {
+        if !active.contains(id.as_str()) {
+            secrets.delete(&id);
+        }
+    }
+    Ok(())
 }
 
-fn read_passwords(data_dir: &Path) -> BTreeMap<String, String> {
-    std::fs::read(data_dir.join(PASSWORDS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
-}
-
-fn write_passwords(data_dir: &Path, all: &BTreeMap<String, String>) -> IdeResult<()> {
-    let bytes = serde_json::to_vec_pretty(all).map_err(|e| IdeError::internal(e.to_string()))?;
-    write_file(&data_dir.join(PASSWORDS_FILE), &bytes, true)
+fn registry_secrets(data_dir: &Path) -> SecretFile {
+    SecretFile::new(data_dir.join(PASSWORDS_FILE))
 }
 
 pub fn registry_password(data_dir: &Path, id: &str) -> Option<String> {
-    read_passwords(data_dir).remove(id)
+    registry_secrets(data_dir).get(id)
 }
 
 /// Saves (or with `None` forgets) the password of registry `id`.
 pub fn set_registry_password(data_dir: &Path, id: &str, password: Option<&str>) -> IdeResult<()> {
-    let mut all = read_passwords(data_dir);
     match password {
-        Some(p) => all.insert(id.to_owned(), p.to_owned()),
-        None => all.remove(id),
-    };
-    write_passwords(data_dir, &all)
+        Some(password) => registry_secrets(data_dir).set(id, password),
+        None => {
+            registry_secrets(data_dir).delete(id);
+            Ok(())
+        }
+    }
 }
 
 fn write_file(path: &Path, bytes: &[u8], private: bool) -> IdeResult<()> {
@@ -324,6 +335,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ide_ssh::secrets::testing::{files_containing, use_memory_store};
 
     #[test]
     fn endpoint_args() {
@@ -373,6 +385,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip_and_passwords() {
+        use_memory_store();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         // Nothing configured: no connection is invented.
@@ -393,14 +406,30 @@ mod tests {
         save_settings(dir, &settings).unwrap();
         assert_eq!(load_settings(dir), settings);
         set_registry_password(dir, "r1", Some("s3cret")).unwrap();
+        assert_eq!(files_containing(dir, "s3cret"), Vec::<PathBuf>::new());
         let auth = auth_for(dir, "ghcr.io/org/app").unwrap();
         assert_eq!((auth.username.as_str(), auth.password.as_str()), ("me", "s3cret"));
         assert!(auth_for(dir, "postgres").is_none());
         save_settings(dir, &DockerSettings { registries: Vec::new(), ..settings }).unwrap();
         assert_eq!(registry_password(dir, "r1"), None);
+        assert_eq!(registry_secrets(dir).keys(), Vec::<String>::new());
         // An empty list stays empty.
         save_settings(dir, &DockerSettings { connections: Vec::new(), registries: Vec::new() }).unwrap();
         assert!(load_settings(dir).connections.is_empty());
+    }
+
+    #[test]
+    fn legacy_plaintext_passwords_are_migrated_off_disk() {
+        use_memory_store();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join(PASSWORDS_FILE), r#"{"r1":"legacy-secret"}"#).unwrap();
+
+        assert_eq!(registry_password(dir, "r1").as_deref(), Some("legacy-secret"));
+        assert_eq!(files_containing(dir, "legacy-secret"), Vec::<PathBuf>::new());
+        let index = std::fs::read_to_string(dir.join(PASSWORDS_FILE)).unwrap();
+        assert!(!index.contains("legacy-secret"));
+        assert_eq!(registry_password(dir, "r1").as_deref(), Some("legacy-secret"));
     }
 
     #[test]

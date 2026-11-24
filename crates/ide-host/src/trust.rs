@@ -315,6 +315,7 @@ pub fn restricted_command_allowed(cmd: &str) -> bool {
         "term_",
         "settings_",
         "project_trust_",
+        "mcp_",
         // New Project writes only where the user chose and runs no code of an open project.
         "scaffold_",
         "ssh_",
@@ -566,6 +567,21 @@ mod tests {
     #[test]
     fn restricted_mode_allows_clipboard_write_text() {
         assert!(super::restricted_command_allowed("clipboard_write_text"));
+    }
+
+    #[test]
+    fn restricted_mode_allows_mcp_window_coordination() {
+        for command in [
+            "mcp_ui_ready",
+            "mcp_respond",
+            "mcp_agent_run_closed",
+            "mcp_server_status",
+            "mcp_set_open_editors",
+            "mcp_set_focused_editor",
+            "mcp_report_problems",
+        ] {
+            assert!(super::restricted_command_allowed(command), "{command}");
+        }
     }
 
     #[test]

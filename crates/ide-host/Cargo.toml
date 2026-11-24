@@ -33,6 +33,7 @@ ide-jvm-attach.workspace = true
 ide-build.workspace = true
 ide-analysis.workspace = true
 ide-coverage.workspace = true
+ide-profiler.workspace = true
 ide-spell.workspace = true
 ide-terminal.workspace = true
 ide-run.workspace = true
@@ -55,6 +56,7 @@ ide-plugin.workspace = true
 ide-tools = { path = "../ide-tools" }
 ide-scaffold.workspace = true
 ide-docker = { path = "../ide-docker" }
+ide-android = { path = "../ide-android" }
 semver = "1"
 serde.workspace = true
 jsonschema = { version = "0.33", default-features = false }

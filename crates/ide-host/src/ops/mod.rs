@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod analysis;
+pub mod android;
 pub mod build;
 pub mod bytes;
 pub mod coverage;
@@ -17,11 +18,13 @@ pub mod env;
 pub mod fs;
 pub mod heap;
 pub mod history;
+pub mod http;
 pub mod java;
 pub mod jvm_icons;
 pub mod lsp;
 pub mod nav;
 pub mod notebook;
+pub mod profiler;
 pub mod project;
 mod python;
 pub mod refactor;
@@ -31,6 +34,7 @@ pub mod scaffold;
 pub mod sdk;
 pub mod search;
 pub mod spell;
+pub mod ssh;
 pub mod syntax;
 pub mod term;
 pub mod tools;
@@ -69,6 +73,7 @@ impl<T> Clone for Channel<T> {
 /// Registers the commands of every module with the remote server.
 pub fn register_all(d: &mut crate::rpc::Dispatcher) {
     agent::register(d);
+    android::register(d);
     lsp::register(d);
     notebook::register(d);
     nav::register(d);
@@ -76,9 +81,12 @@ pub fn register_all(d: &mut crate::rpc::Dispatcher) {
     analysis::register(d);
     syntax::register(d);
     spell::register(d);
+    ssh::register(d);
     dependencies::register(d);
     history::register(d);
+    http::register(d);
     coverage::register(d);
+    profiler::register(d);
     build::register(d);
     tools::register(d);
     scaffold::register(d);

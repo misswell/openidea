@@ -208,6 +208,13 @@ mod tests {
                 serde_json::json!([]),
             )
             .unwrap();
+        settings
+            .set(
+                ide_workspace::settings::SettingsScope::Global,
+                "languages.java.maven.userSettings",
+                serde_json::json!(base.join("missing-settings.xml")),
+            )
+            .unwrap();
         let scopes = scopes_at(&workspace, &cache, &config, Settings::default()).unwrap();
         assert_eq!(scopes[0].cache, first_cache);
         let model = load_scopes(&workspace, &scopes);

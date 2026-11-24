@@ -44,6 +44,13 @@ fn languages(host: &Host, window: &str) -> Vec<ide_language::LanguageConfig> {
     langs
 }
 
+/// The UI-facing language catalog for remote clients. This is the same
+/// registry and project server overlay the desktop shell's `languages`
+/// command returns, including plugin contributions.
+pub fn language_list(host: &Host, window: &str) -> Vec<ide_language::LanguageInfo> {
+    languages(host, window).iter().map(ide_language::LanguageInfo::from).collect()
+}
+
 fn join_err(e: impl std::fmt::Display) -> IdeError {
     IdeError::internal(e.to_string())
 }
@@ -180,6 +187,7 @@ pub async fn jdtls_required_java(host: &Host, window: &str) -> IdeResult<Option<
 
 /// Commands of this module the remote server answers.
 pub(crate) fn register(d: &mut Dispatcher) {
+    d.add("languages", |c| async move { Ok(language_list(&c.host, &c.window)) });
     d.add("tools_list", |c| async move { tools_list(&c.host, &c.window).await });
     d.add("tools_install", |c| async move {
         tools_install(&c.host, &c.window, c.arg("name")?, c.arg("request")?, c.sender("onEvent")?).await

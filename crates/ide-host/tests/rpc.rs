@@ -77,6 +77,19 @@ async fn serves_projects_files_documents_search_and_runs() {
     let opened = invoke(&peer, "open_project", json!({ "path": project })).await.unwrap();
     assert_eq!(opened["name"], "demo");
     assert_eq!(opened["trusted"], false);
+    let languages = invoke(&peer, "languages", json!({})).await.unwrap();
+    assert!(
+        languages.as_array().unwrap().iter().any(|language| {
+            language["id"] == "java"
+                && language["name"] == "Java"
+                && language["extensions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|extension| extension.as_str().unwrap_or("").trim_start_matches('.') == "java")
+        }),
+        "{languages}"
+    );
     invoke(&peer, "index_status", json!({})).await.unwrap();
     assert_eq!(invoke(&peer, "lsp_servers", json!({})).await.unwrap(), json!([]));
     invoke(&peer, "lsp_resend_diagnostics", json!({})).await.unwrap();
@@ -134,6 +147,54 @@ async fn serves_projects_files_documents_search_and_runs() {
     let current = invoke(&peer, "project_current", json!({})).await.unwrap();
     assert_eq!(current["name"], "demo");
 
+    // MCP window requests use the same backend host as the desktop commands.
+    invoke(&peer, "mcp_ui_ready", json!({"ready": true})).await.unwrap();
+    let expired = invoke(&peer, "mcp_respond", json!({"id": 404, "allow": true, "error": null})).await.unwrap_err();
+    assert!(expired.message.contains("expired or belongs to another window"), "{expired:?}");
+    invoke(&peer, "mcp_agent_run_closed", json!({"name": "_agent_missing"})).await.unwrap();
+    invoke(&peer, "mcp_set_open_editors", json!({"paths": [project.join("src/main.py")]})).await.unwrap();
+    invoke(
+        &peer,
+        "mcp_set_focused_editor",
+        json!({
+            "editor": {
+                "path": project.join("src/main.py"),
+                "selection": {
+                    "start": {"line": 0, "col": 0},
+                    "end": {"line": 0, "col": 4}
+                },
+                "selectedText": "prin"
+            },
+            "focused": true
+        }),
+    )
+    .await
+    .unwrap();
+    invoke(
+        &peer,
+        "mcp_report_problems",
+        json!({
+            "reset": true,
+            "files": [{
+                "path": project.join("src/main.py"),
+                "items": []
+            }]
+        }),
+    )
+    .await
+    .unwrap();
+    invoke(&peer, "mcp_ui_ready", json!({"ready": false})).await.unwrap();
+    for command in [
+        "mcp_ui_ready",
+        "mcp_respond",
+        "mcp_agent_run_closed",
+        "mcp_set_open_editors",
+        "mcp_set_focused_editor",
+        "mcp_report_problems",
+    ] {
+        assert!(Dispatcher::standard().commands().contains(&command), "missing MCP command {command}");
+    }
+
     // The built-in web server runs where the project is; the client forwards its port.
     let root = std::path::PathBuf::from(opened["root"].as_str().unwrap());
     let url = invoke(&peer, "web_url", json!({ "path": root.join("src/main.py") })).await.unwrap();
@@ -142,6 +203,72 @@ async fn serves_projects_files_documents_search_and_runs() {
 
     let entries = invoke(&peer, "fs_read_dir", json!({ "path": project })).await.unwrap();
     assert!(entries.as_array().unwrap().iter().any(|e| e["name"] == "src"), "{entries}");
+
+    // Sandboxed plugin workspace APIs use the same host filesystem as remote projects.
+    let plugin_root = dunce::canonicalize(&project).unwrap();
+    let plugin_read = invoke(
+        &peer,
+        "plugin_workspace_read_text",
+        json!({"root": plugin_root, "path": "src/main.py", "request": 530}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plugin_read, "print('needle')\n");
+    let plugin_stat =
+        invoke(&peer, "plugin_workspace_stat", json!({"root": plugin_root, "path": "src/main.py", "request": 531}))
+            .await
+            .unwrap();
+    assert_eq!(plugin_stat["isDir"], false);
+    assert_eq!(plugin_stat["size"], 16);
+    let missing_stat =
+        invoke(&peer, "plugin_workspace_stat", json!({"root": plugin_root, "path": "src/missing.py", "request": 532}))
+            .await
+            .unwrap();
+    assert!(missing_stat.is_null());
+    invoke(
+        &peer,
+        "plugin_workspace_write_text",
+        json!({"root": plugin_root, "path": "src/generated/Plugin.java", "text": "class Plugin {}", "request": 533}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(project.join("src/generated/Plugin.java")).unwrap(), "class Plugin {}");
+    let plugin_files = invoke(
+        &peer,
+        "plugin_workspace_find_files",
+        json!({"root": plugin_root, "glob": "*.py", "limit": 20, "request": 534}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plugin_files, json!(["src/main.py"]));
+    let error = invoke(
+        &peer,
+        "plugin_workspace_write_text",
+        json!({"root": plugin_root, "path": ".git/config", "text": "unsafe", "request": 535}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, ide_core::error::ErrorKind::InvalidInput);
+    invoke(&peer, "cancel_request", json!({"id": 536})).await.unwrap();
+    let error =
+        invoke(&peer, "plugin_workspace_stat", json!({"root": plugin_root, "path": "src/main.py", "request": 536}))
+            .await
+            .unwrap_err();
+    assert_eq!(error.kind, ide_core::error::ErrorKind::Cancelled);
+    #[cfg(unix)]
+    {
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("src/escape.txt")).unwrap();
+        let error = invoke(
+            &peer,
+            "plugin_workspace_read_text",
+            json!({"root": plugin_root, "path": "src/escape.txt", "request": 537}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ide_core::error::ErrorKind::InvalidInput);
+    }
 
     // Directory comparisons, streamed progress and confirmed copies share the remote filesystem.
     let left = project.join("compare-left");
@@ -329,6 +456,8 @@ async fn local_deployment_runs_on_the_project_host() {
     }));
     let dispatcher = Dispatcher::standard();
     for cmd in [
+        "android_devices",
+        "android_logcat",
         "deploy_coverage",
         "deploy_upload",
         "deploy_download",
@@ -338,6 +467,10 @@ async fn local_deployment_runs_on_the_project_host() {
         "deploy_info",
         "deploy_server_root",
         "deploy_test_connection",
+        "plugin_workspace_find_files",
+        "plugin_workspace_read_text",
+        "plugin_workspace_stat",
+        "plugin_workspace_write_text",
         "remote_list",
         "remote_open",
         "remote_of",
@@ -372,6 +505,9 @@ async fn local_deployment_runs_on_the_project_host() {
         "db_table_page",
         "db_apply_edits",
         "db_console_path",
+        "profiler_prepare",
+        "profiler_collect",
+        "profiler_gc_before_stop",
     ] {
         assert!(dispatcher.commands().contains(&cmd), "missing host command {cmd}");
     }
@@ -487,5 +623,6 @@ async fn the_desktop_routes_exactly_what_a_server_of_this_build_answers() {
     dispatcher.add(ide_host::plugins::remote::SYNC_COMMAND, |_| async { Ok(()) });
     assert_eq!(rpc::client_commands(), dispatcher.commands());
     assert!(rpc::client_commands().contains(&"term_spawn"));
+    assert!(rpc::client_commands().contains(&"ssh_open_terminal"));
     plugins.host().shutdown();
 }

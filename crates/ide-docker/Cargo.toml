@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ide-core.workspace = true
+ide-ssh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 specta.workspace = true
@@ -14,4 +15,5 @@ tracing.workspace = true
 which = "8"
 
 [dev-dependencies]
+ide-ssh = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

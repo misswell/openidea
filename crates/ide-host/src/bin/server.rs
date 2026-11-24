@@ -6,14 +6,104 @@ use ide_host::plugins::remote_host::RemotePlugins;
 use ide_host::rpc::{self, Dispatcher};
 use ide_host::{Host, HostConfig};
 use ide_language::LanguageRegistry;
+use parking_lot::Mutex;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+
+struct McpService {
+    host: Arc<Host>,
+    data_dir: PathBuf,
+    server: Mutex<Option<ide_mcp::McpServer>>,
+    error: Mutex<Option<String>>,
+}
+
+impl McpService {
+    fn new(host: Arc<Host>, data_dir: PathBuf) -> Self {
+        Self { host, data_dir, server: Mutex::new(None), error: Mutex::new(None) }
+    }
+
+    fn apply(&self) {
+        let enabled = self.host.global_settings.effective().mcp_server.enabled;
+        let mut server = self.server.lock();
+        if !enabled {
+            if let Some(running) = server.take() {
+                running.stop();
+            }
+            self.host.set_mcp_executable(None);
+            *self.error.lock() = None;
+            return;
+        }
+        if server.is_some() {
+            return;
+        }
+        match ide_mcp::McpServer::start(
+            Arc::new(ide_host::mcp::Registry::new(self.host.clone())),
+            Some(ide_mcp::discovery_path(&self.data_dir)),
+            &self.host.runtime,
+        ) {
+            Ok(started) => {
+                self.host.set_mcp_executable(std::env::current_exe().ok());
+                *server = Some(started);
+                *self.error.lock() = None;
+            }
+            Err(e) => {
+                tracing::warn!("MCP server: {e}");
+                *self.error.lock() = Some(e.to_string());
+            }
+        }
+    }
+
+    fn status(&self, window: &str) -> McpServiceStatus {
+        let root = self.host.project(window).ok().map(|project| project.root.clone());
+        let server = self.server.lock();
+        let exe = std::env::current_exe().unwrap_or_default();
+        McpServiceStatus {
+            running: server.is_some(),
+            error: self.error.lock().clone(),
+            port: server.as_ref().map(ide_mcp::McpServer::port),
+            project: root.clone().map(ide_core::IpcPath::from),
+            url: server.as_ref().zip(root.as_ref()).map(|(server, root)| server.url(root)),
+            token: server.as_ref().map(|server| server.token().to_owned()),
+            stdio_command: root.as_ref().map(|root| ide_mcp::stdio_command(&exe, root)).unwrap_or_default(),
+        }
+    }
+
+    fn stop(&self) {
+        self.host.set_mcp_executable(None);
+        if let Some(server) = self.server.lock().take() {
+            server.stop();
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServiceStatus {
+    running: bool,
+    error: Option<String>,
+    port: Option<u16>,
+    project: Option<ide_core::IpcPath>,
+    url: Option<String>,
+    token: Option<String>,
+    stdio_command: Vec<String>,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version") {
         println!("openidea-server {} (protocol {})", env!("CARGO_PKG_VERSION"), rpc::PROTOCOL_VERSION);
         return;
+    }
+    if args.iter().any(|a| a == ide_mcp::STDIO_FLAG) {
+        let home = dirs::home_dir().unwrap_or_default();
+        let base =
+            std::env::var_os("OPENIDEA_SERVER_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".openidea"));
+        let mut process_args = vec!["openidea-server".to_owned()];
+        process_args.extend(args.iter().cloned());
+        let project = ide_mcp::stdio_request(&process_args).flatten();
+        let discovery = ide_mcp::discovery_path(&base.join("data"));
+        std::process::exit(ide_mcp::stdio::run(&discovery, project));
     }
     if args.first().is_some_and(|a| a == "--connect") {
         // One forwarded connection (see `ide_host::relay`): stdout carries its bytes.
@@ -30,7 +120,7 @@ fn main() {
         std::process::exit(code);
     }
     if !args.iter().any(|a| a == "--stdio") {
-        eprintln!("usage: openidea-server --stdio | --connect <host> <port> | --version");
+        eprintln!("usage: openidea-server --stdio | --mcp-stdio | --connect <host> <port> | --version");
         std::process::exit(2);
     }
     // stdout carries the protocol: logs go to stderr.
@@ -73,6 +163,7 @@ async fn run(base: PathBuf) -> i32 {
     let peer = Arc::new(OnceLock::new());
     let sink_peer = peer.clone();
     let plugins_data = data_dir.clone();
+    let mcp_data = data_dir.clone();
     let host = Arc::new(Host::new(HostConfig {
         config_dir,
         local_data_dir: data_dir.clone(),
@@ -98,6 +189,8 @@ async fn run(base: PathBuf) -> i32 {
         tracing::warn!("cannot trust {}: {e}", root.to_string_lossy());
     }
     tracing::info!("openidea-server {} ready", env!("CARGO_PKG_VERSION"));
+    let mcp = Arc::new(McpService::new(host.clone(), mcp_data));
+    mcp.apply();
     let mut dispatcher = Dispatcher::standard();
     if let Some(plugins) = &plugins {
         plugins.register(&mut dispatcher);
@@ -110,7 +203,25 @@ async fn run(base: PathBuf) -> i32 {
             Ok(report)
         }
     });
+    let settings_mcp = mcp.clone();
+    dispatcher.add("settings_set", move |c| {
+        let mcp = settings_mcp.clone();
+        async move {
+            let key: String = c.arg("key")?;
+            let settings = rpc::set_settings(&c)?;
+            if key == "mcpServer" || key.starts_with("mcpServer.") {
+                mcp.apply();
+            }
+            Ok(settings)
+        }
+    });
+    let status_mcp = mcp.clone();
+    dispatcher.add("mcp_server_status", move |c| {
+        let mcp = status_mcp.clone();
+        async move { Ok(mcp.status(&c.window)) }
+    });
     rpc::serve(host.clone(), dispatcher, peer, tokio::io::stdin(), tokio::io::stdout()).await;
+    mcp.stop();
     if let Some(plugins) = &plugins {
         plugins.host().shutdown();
     }

@@ -176,7 +176,24 @@ impl SshManager {
 
     /// Trusts the host key that failed the last connection under `key` (adds it to `known_hosts`).
     pub async fn trust_host(&self, key: &str) -> IdeResult<()> {
-        let k = self.unknown.lock().remove(key).ok_or_else(|| IdeError::not_found("no host key to trust"))?;
+        self.trust_host_matching(key, None).await
+    }
+
+    /// Trusts the captured key only when it still has `fingerprint`.
+    ///
+    /// Passing the fingerprint prevents a concurrent reconnect from replacing
+    /// the pending key between the prompt and the user's approval.
+    pub async fn trust_host_matching(&self, key: &str, fingerprint: Option<&str>) -> IdeResult<()> {
+        let k = {
+            let mut unknown = self.unknown.lock();
+            let captured = unknown.get(key).ok_or_else(|| IdeError::not_found("no host key to trust"))?;
+            if let Some(expected) = fingerprint.filter(|value| !value.trim().is_empty()) {
+                if captured.fingerprint() != expected.trim() {
+                    return Err(IdeError::invalid("the SSH host key changed while the trust prompt was open"));
+                }
+            }
+            unknown.remove(key).expect("the captured key was present above")
+        };
         let path = self.files.known_hosts.clone();
         tokio::task::spawn_blocking(move || k.trust(&path)).await.map_err(|e| IdeError::internal(e.to_string()))?
     }
@@ -193,5 +210,37 @@ impl SshManager {
     /// Whether connecting to `config` will need a secret the user has not given.
     pub fn needs_secret(&self, config: &SshConfiguration) -> bool {
         config.auth == SshAuth::Password && self.secret(config).is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn trust_requires_the_fingerprint_that_was_prompted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SshManager::new(tmp.path().join("secrets.json"));
+        let private = russh::keys::decode_secret_key(
+            &std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssh/host"))
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+        let captured = UnknownHostKey {
+            host: "build.example".into(),
+            port: 22,
+            key: private.public_key().clone(),
+            known_hosts: None,
+        };
+        let fingerprint = captured.fingerprint();
+        manager.unknown.lock().insert("build".into(), captured);
+
+        assert!(manager.trust_host_matching("build", Some("ED25519 SHA256:changed")).await.is_err());
+        assert!(manager.unknown.lock().contains_key("build"));
+
+        manager.trust_host_matching("build", Some(&fingerprint)).await.unwrap();
+        assert!(!manager.unknown.lock().contains_key("build"));
+        assert!(manager.files.known_hosts.exists());
     }
 }

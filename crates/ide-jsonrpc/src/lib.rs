@@ -238,7 +238,7 @@ impl Handler for NoopHandler {
 type Pending = HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>;
 
 struct Inner {
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: mpsc::Sender<Vec<u8>>,
     pending: Mutex<Pending>,
     next_id: AtomicI64,
     /// Set once the transport is gone; new requests fail fast.
@@ -262,7 +262,10 @@ impl Inner {
         }
         let body = serde_json::to_vec(value).map_err(|e| RpcError::Protocol(e.to_string()))?;
         tracing::trace!(target: "ide_jsonrpc::wire", "--> {}", String::from_utf8_lossy(&body));
-        self.out.send(body).map_err(|_| RpcError::Closed)
+        self.out.try_send(body).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => RpcError::Protocol("outbound queue is full".into()),
+            mpsc::error::TrySendError::Closed(_) => RpcError::Closed,
+        })
     }
 
     /// Fails every in-flight request and refuses new ones.
@@ -325,6 +328,8 @@ impl Framing {
 
 /// How long a process that exited is given for its last output to be read.
 const OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+const OUTBOUND_QUEUE_MESSAGES: usize = 4096;
+const INBOUND_QUEUE_MESSAGES: usize = 1024;
 
 /// A connected JSON-RPC peer. Cloning shares the connection.
 #[derive(Clone)]
@@ -510,7 +515,7 @@ impl Peer {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_MESSAGES);
         let (closed, _) = watch::channel(None);
         let inner = Arc::new(Inner {
             out: out_tx,
@@ -554,7 +559,7 @@ impl Peer {
         // queue, so a request handler sees every notification that arrived before it, and responses
         // complete from it, so a caller sees the notifications sent before its response (a streamed
         // result's last values).
-        let (notif_tx, notif_rx) = std::sync::mpsc::channel::<Incoming>();
+        let (notif_tx, mut notif_rx) = mpsc::channel::<Incoming>(INBOUND_QUEUE_MESSAGES);
         {
             let handler = handler.clone();
             let inner = inner.clone();
@@ -562,7 +567,7 @@ impl Peer {
             std::thread::Builder::new()
                 .name("jsonrpc-notify".into())
                 .spawn(move || {
-                    while let Ok(msg) = notif_rx.recv() {
+                    while let Some(msg) = notif_rx.blocking_recv() {
                         match msg {
                             Incoming::Notification(method, params) => {
                                 let h = handler.clone();
@@ -610,7 +615,9 @@ impl Peer {
                     match msg {
                         Ok(Some(body)) => {
                             seen_message.store(true, Ordering::Relaxed);
-                            dispatch(&inner, &notif_tx, &body);
+                            if dispatch(&inner, &notif_tx, &body).await.is_err() {
+                                break;
+                            }
                         }
                         Ok(None) => break,
                         Err(e) => {
@@ -783,18 +790,18 @@ async fn handle_request(inner: Arc<Inner>, handler: Arc<dyn Handler>, id: Value,
     }
 }
 
-fn dispatch(inner: &Arc<Inner>, notif_tx: &std::sync::mpsc::Sender<Incoming>, body: &[u8]) {
+async fn dispatch(inner: &Arc<Inner>, notif_tx: &mpsc::Sender<Incoming>, body: &[u8]) -> Result<(), ()> {
     tracing::trace!(target: "ide_jsonrpc::wire", "<-- {}", String::from_utf8_lossy(body));
     let msg: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("jsonrpc: unparsable message: {e}");
-            return;
+            return Ok(());
         }
     };
     let Value::Object(mut obj) = msg else {
         tracing::warn!("jsonrpc: ignoring non-object message");
-        return;
+        return Ok(());
     };
     let id = obj.remove("id");
     match obj.remove("method") {
@@ -802,10 +809,10 @@ fn dispatch(inner: &Arc<Inner>, notif_tx: &std::sync::mpsc::Sender<Incoming>, bo
             let params = obj.remove("params").unwrap_or(Value::Null);
             match id {
                 Some(id) if !id.is_null() => {
-                    let _ = notif_tx.send(Incoming::Request(id, method, params));
+                    notif_tx.send(Incoming::Request(id, method, params)).await.map_err(|_| ())?;
                 }
                 _ => {
-                    let _ = notif_tx.send(Incoming::Notification(method, params));
+                    notif_tx.send(Incoming::Notification(method, params)).await.map_err(|_| ())?;
                 }
             }
         }
@@ -815,11 +822,11 @@ fn dispatch(inner: &Arc<Inner>, notif_tx: &std::sync::mpsc::Sender<Incoming>, bo
                 if let Some(err) = obj.get("error") {
                     tracing::warn!("jsonrpc: error response without id: {err}");
                 }
-                return;
+                return Ok(());
             };
             let Some(tx) = inner.pending.lock().remove(&id) else {
                 tracing::debug!("jsonrpc: response for unknown request {id}");
-                return;
+                return Ok(());
             };
             let result = match obj.remove("error") {
                 Some(err) if !err.is_null() => {
@@ -836,9 +843,10 @@ fn dispatch(inner: &Arc<Inner>, notif_tx: &std::sync::mpsc::Sender<Incoming>, bo
                 }
                 _ => Ok(obj.remove("result").unwrap_or(Value::Null)),
             };
-            let _ = notif_tx.send(Incoming::Response(tx, result));
+            notif_tx.send(Incoming::Response(tx, result)).await.map_err(|_| ())?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

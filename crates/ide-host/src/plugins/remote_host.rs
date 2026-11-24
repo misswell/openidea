@@ -84,10 +84,19 @@ pub const COMMANDS: &[&str] = &[
     "plugin_navigation_index",
     "plugin_navigation_goto",
     "plugin_navigation_markers",
+    "plugin_list",
     "plugin_endpoints",
     "plugin_run_targets",
     "plugin_answer_run_target",
     "plugin_line_markers",
+    "plugin_read_intellij_theme",
+    "plugin_installed_intellij_themes",
+    "plugin_stage_package",
+    "plugin_preview_install",
+    "plugin_install_dir",
+    "plugin_grant",
+    "plugin_set_enabled",
+    "plugin_uninstall",
 ];
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -192,6 +201,7 @@ pub fn forwarded(event: &PluginEvent) -> bool {
             | PluginEvent::DecorationsChanged { .. }
             | PluginEvent::EditorOpen { .. }
             | PluginEvent::EditorRanges { .. }
+            | PluginEvent::EndpointsChanged { .. }
             | PluginEvent::Notification { .. }
             | PluginEvent::StatusItemChanged { .. }
             | PluginEvent::WindowStatusItemChanged { .. }
@@ -215,7 +225,6 @@ pub fn forwarded(event: &PluginEvent) -> bool {
             | PluginEvent::PromptWaiting { .. }
             | PluginEvent::RevealView { .. }
             | PluginEvent::CommitRequested { .. }
-            | PluginEvent::EndpointsChanged { .. }
     )
 }
 
@@ -493,6 +502,74 @@ impl RemotePlugins {
             }
         });
         let host = Arc::downgrade(&self.host);
+        let h = host.clone();
+        d.add("plugin_read_intellij_theme", move |c| {
+            let h = h.clone();
+            async move {
+                alive(&h)?;
+                let path: PathBuf = c.arg("path")?;
+                blocking(move || super::intellij::read_source(&path)).await
+            }
+        });
+        d.add("plugin_installed_intellij_themes", |_| async move { Ok(super::intellij::installed_themes()) });
+        let h = host.clone();
+        d.add("plugin_stage_package", move |c| {
+            let h = h.clone();
+            async move {
+                let host = alive(&h)?;
+                let name: String = c.arg("name")?;
+                let files: Vec<super::PackageFile> = c.arg("files")?;
+                blocking(move || host.stage_package(&name, &files)).await
+            }
+        });
+        let h = host.clone();
+        d.add("plugin_preview_install", move |c| {
+            let h = h.clone();
+            async move {
+                let host = alive(&h)?;
+                let path: PathBuf = c.arg("path")?;
+                blocking(move || host.preview_install(&path)).await
+            }
+        });
+        let h = host.clone();
+        d.add("plugin_install_dir", move |c| {
+            let h = h.clone();
+            async move {
+                let host = alive(&h)?;
+                let path: PathBuf = c.arg("path")?;
+                let consent: Consent = c.arg("consent")?;
+                blocking(move || host.install_from_dir(&path, &consent)).await
+            }
+        });
+        let h = host.clone();
+        d.add("plugin_grant", move |c| {
+            let h = h.clone();
+            async move {
+                let host = alive(&h)?;
+                let id: String = c.arg("id")?;
+                let consent: Consent = c.arg("consent")?;
+                blocking(move || host.grant(&id, &consent)).await
+            }
+        });
+        let h = host.clone();
+        d.add("plugin_set_enabled", move |c| {
+            let h = h.clone();
+            async move {
+                let host = alive(&h)?;
+                let id: String = c.arg("id")?;
+                let enabled: bool = c.arg("enabled")?;
+                blocking(move || host.set_enabled(&id, enabled)).await
+            }
+        });
+        let h = host.clone();
+        d.add("plugin_uninstall", move |c| {
+            let h = h.clone();
+            async move {
+                let host = alive(&h)?;
+                let id: String = c.arg("id")?;
+                blocking(move || host.uninstall(&id)).await
+            }
+        });
         let h = host.clone();
         d.add("plugin_run_command", move |c| {
             let h = h.clone();
@@ -811,6 +888,22 @@ impl RemotePlugins {
             }
         });
         let h = host.clone();
+        d.add("plugin_list", move |c| {
+            let h = h.clone();
+            async move {
+                let plugins = alive(&h)?;
+                let root = c.host.project(&c.window).ok().map(|project| project.root.clone());
+                blocking(move || {
+                    plugins.sync_links();
+                    if let Some(root) = root.as_deref() {
+                        plugins.sync_project(root);
+                    }
+                    Ok(plugins.list(root.as_deref()))
+                })
+                .await
+            }
+        });
+        let h = host.clone();
         d.add("plugin_endpoints", move |c| {
             let h = h.clone();
             async move { super::index_ops::plugin_endpoints(&c.host, alive(&h)?, &c.window, c.arg("pluginId")?).await }
@@ -1042,5 +1135,11 @@ mod tests {
             new_window: true,
         };
         assert!(!forwarded(&open));
+    }
+
+    #[test]
+    fn endpoint_invalidations_reach_the_remote_search_ui() {
+        let event = PluginEvent::EndpointsChanged { plugin_id: "routes".into(), root: "/project".into() };
+        assert!(forwarded(&event));
     }
 }
